@@ -60,7 +60,7 @@ impl KeySection {
 
     ///
     pub async fn increase_full_node_count(&mut self, node_id: PublicKey) -> Result<()> {
-        self.transfers.increase_full_node_count(node_id)
+        self.transfers.increase_full_node_count(node_id).await
     }
 
     /// Initiates as first node in a network.

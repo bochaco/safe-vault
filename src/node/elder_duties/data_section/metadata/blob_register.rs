@@ -13,7 +13,7 @@ use crate::{
     node::node_ops::{NodeMessagingDuty, NodeOperation},
     Error, Network, Result, ToDbKey,
 };
-use log::{info, trace, warn};
+use log::{error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use sn_data_types::{Blob, BlobAddress, Error as DtError, PublicKey, Result as NdResult};
 use sn_messaging::{
@@ -84,7 +84,7 @@ impl BlobRegister {
     ) -> Result<NodeMessagingDuty> {
         // If the data already exist, check the existing no of copies.
         // If no of copies are less then required, then continue with the put request.
-        let target_holders = if let Ok(metadata) = self.get_metadata_for(*data.address()) {
+        let target_holders = if let Ok(metadata) = self.get_metadata_for(*data.address()).await {
             if metadata.holders.len() == CHUNK_COPY_COUNT {
                 if data.is_pub() {
                     trace!("{}: All good, {:?}, chunk already exists.", self, data);
@@ -131,14 +131,15 @@ impl BlobRegister {
 
         info!("Storing {} copies of the data", target_holders.len());
 
-        let results: Vec<_> = (&target_holders)
-            .iter()
-            .map(|holder| self.set_chunk_holder(*data.address(), *holder, origin.id().public_key()))
-            .filter(|res| res.is_err())
-            .collect();
-        if !results.is_empty() {
-            info!("Results is not empty!");
+        for holder in (&target_holders).iter() {
+            if let Err(err) = self
+                .set_chunk_holder(*data.address(), *holder, origin.id().public_key())
+                .await
+            {
+                error!("Error occurred when setting chunk holders: {}", err);
+            }
         }
+
         let message = Message::NodeCmd {
             cmd: NodeCmd::Data(NodeDataCmd::Blob(BlobWrite::New(data))),
             id: msg_id,
@@ -179,7 +180,7 @@ impl BlobRegister {
         origin: MsgSender,
         proxies: Vec<MsgSender>,
     ) -> Result<NodeMessagingDuty> {
-        let metadata = match self.get_metadata_for(address) {
+        let metadata = match self.get_metadata_for(address).await {
             Ok(metadata) => metadata,
             Err(error) => return self.send_blob_cmd_error(error, msg_id, origin).await,
         };
@@ -198,11 +199,9 @@ impl BlobRegister {
             }
         };
 
-        let results: Vec<_> = (&metadata.holders)
-            .iter()
-            .map(|holder_name| self.remove_chunk_holder(address, *holder_name))
-            .collect();
-        if !results.is_empty() {}
+        for holder_name in (&metadata.holders).iter() {
+            self.remove_chunk_holder(address, *holder_name).await?;
+        }
 
         let message = Message::NodeCmd {
             cmd: NodeCmd::Data(NodeDataCmd::Blob(BlobWrite::DeletePrivate(address))),
@@ -213,7 +212,7 @@ impl BlobRegister {
             .await
     }
 
-    fn set_chunk_holder(
+    async fn set_chunk_holder(
         &mut self,
         blob_address: BlobAddress,
         holder: XorName,
@@ -226,26 +225,30 @@ impl BlobRegister {
         info!("Setting chunk holder");
 
         let db_key = blob_address.to_db_key()?;
-        let mut metadata = self.get_metadata_for(blob_address).unwrap_or_default();
+        let mut metadata = self
+            .get_metadata_for(blob_address)
+            .await
+            .unwrap_or_default();
         if blob_address.is_unpub() {
             metadata.owner = Some(origin);
         }
 
         let _ = metadata.holders.insert(holder);
 
-        if let Err(error) = self.dbs.metadata.borrow_mut().set(&db_key, &metadata) {
+        if let Err(error) = self.dbs.metadata.lock().await.set(&db_key, &metadata) {
             warn!("{}: Failed to write metadata to DB: {:?}", self, error);
             return Err(error.into());
         }
 
         // We're acting as data handler, received request from client handlers
-        let mut holders_metadata = self.get_holder(holder).unwrap_or_default();
+        let mut holders_metadata = self.get_holder(holder).await.unwrap_or_default();
         let _ = holders_metadata.chunks.insert(blob_address);
 
         if let Err(error) = self
             .dbs
             .holders
-            .borrow_mut()
+            .lock()
+            .await
             .set(&holder.to_db_key()?, &holders_metadata)
         {
             warn!("{}: Failed to write metadata to DB: {:?}", self, error);
@@ -254,21 +257,21 @@ impl BlobRegister {
         Ok(())
     }
 
-    fn remove_chunk_holder(
+    async fn remove_chunk_holder(
         &mut self,
         blob_address: BlobAddress,
         holder_name: XorName,
     ) -> Result<()> {
         let db_key = blob_address.to_db_key()?;
-        let metadata = self.get_metadata_for(blob_address);
+        let metadata = self.get_metadata_for(blob_address).await;
         if let Ok(mut metadata) = metadata {
-            let holder = self.get_holder(holder_name);
+            let holder = self.get_holder(holder_name).await;
 
             // Remove the chunk from the holder metadata
             if let Ok(mut holder) = holder {
                 let _ = holder.chunks.remove(&blob_address);
                 if holder.chunks.is_empty() {
-                    if let Err(error) = self.dbs.holders.borrow_mut().rem(&holder_name.to_db_key()?)
+                    if let Err(error) = self.dbs.holders.lock().await.rem(&holder_name.to_db_key()?)
                     {
                         warn!(
                             "{}: Failed to delete holder metadata from DB: {:?}",
@@ -278,7 +281,8 @@ impl BlobRegister {
                 } else if let Err(error) = self
                     .dbs
                     .holders
-                    .borrow_mut()
+                    .lock()
+                    .await
                     .set(&holder_name.to_db_key()?, &holder)
                 {
                     warn!(
@@ -291,13 +295,13 @@ impl BlobRegister {
             // Remove the holder from the chunk metadata
             let _ = metadata.holders.remove(&holder_name);
             if metadata.holders.is_empty() {
-                if let Err(error) = self.dbs.metadata.borrow_mut().rem(&db_key) {
+                if let Err(error) = self.dbs.metadata.lock().await.rem(&db_key) {
                     warn!(
                         "{}: Failed to delete chunk metadata from DB: {:?}",
                         self, error
                     );
                 }
-            } else if let Err(error) = self.dbs.metadata.borrow_mut().set(&db_key, &metadata) {
+            } else if let Err(error) = self.dbs.metadata.lock().await.set(&db_key, &metadata) {
                 warn!(
                     "{}: Failed to write chunk metadata to DB: {:?}",
                     self, error
@@ -310,7 +314,7 @@ impl BlobRegister {
     pub(super) async fn replicate_chunks(&mut self, holder: XorName) -> Result<NodeOperation> {
         trace!("Replicating chunks of holder {:?}", holder);
 
-        let chunks_stored = match self.remove_holder(holder) {
+        let chunks_stored = match self.remove_holder(holder).await {
             Ok(chunks) => chunks,
             _ => return Ok(NodeOperation::NoOp),
         };
@@ -391,7 +395,7 @@ impl BlobRegister {
             }
         };
 
-        let metadata = match self.get_metadata_for(address) {
+        let metadata = match self.get_metadata_for(address).await {
             Ok(metadata) => metadata,
             Err(error) => return query_error(error).await,
         };
@@ -414,29 +418,31 @@ impl BlobRegister {
     }
 
     #[allow(unused)]
-    pub(super) fn update_holders(
+    pub(super) async fn update_holders(
         &mut self,
         address: BlobAddress,
         holder: XorName,
         result: NdResult<()>,
         message_id: MessageId,
     ) -> Result<NodeMessagingDuty> {
-        let mut chunk_metadata = self.get_metadata_for(address).unwrap_or_default();
+        let mut chunk_metadata = self.get_metadata_for(address).await.unwrap_or_default();
         let _ = chunk_metadata.holders.insert(holder);
         if let Err(error) = self
             .dbs
             .metadata
-            .borrow_mut()
+            .lock()
+            .await
             .set(&address.to_db_key()?, &chunk_metadata)
         {
             warn!("{}: Failed to write metadata to DB: {:?}", self, error);
         }
-        let mut holders_metadata = self.get_holder(holder).unwrap_or_default();
+        let mut holders_metadata = self.get_holder(holder).await.unwrap_or_default();
         let _ = holders_metadata.chunks.insert(address);
         if let Err(error) = self
             .dbs
             .holders
-            .borrow_mut()
+            .lock()
+            .await
             .set(&holder.to_db_key()?, &holders_metadata)
         {
             warn!(
@@ -450,15 +456,18 @@ impl BlobRegister {
 
     // Updates the metadata of the chunks help by a node that left.
     // Returns the list of chunks that were held along with the remaining holders.
-    fn remove_holder(&mut self, node: XorName) -> Result<BTreeMap<BlobAddress, BTreeSet<XorName>>> {
+    async fn remove_holder(
+        &mut self,
+        node: XorName,
+    ) -> Result<BTreeMap<BlobAddress, BTreeSet<XorName>>> {
         let mut blob_addresses: BTreeMap<BlobAddress, BTreeSet<XorName>> = BTreeMap::new();
-        let chunk_holder = self.get_holder(node);
+        let chunk_holder = self.get_holder(node).await;
 
         if let Ok(holder) = chunk_holder {
             for chunk_address in holder.chunks {
                 let db_key = chunk_address.to_db_key()?;
                 // .map_err(|e| DtError::NetworkOther(e.to_string()))?;
-                let chunk_metadata = self.get_metadata_for(chunk_address);
+                let chunk_metadata = self.get_metadata_for(chunk_address).await;
 
                 if let Ok(mut metadata) = chunk_metadata {
                     if !metadata.holders.remove(&node) {
@@ -468,11 +477,11 @@ impl BlobRegister {
                     let _ = blob_addresses.insert(chunk_address, metadata.holders.clone());
 
                     if metadata.holders.is_empty() {
-                        if let Err(error) = self.dbs.metadata.borrow_mut().rem(&db_key) {
+                        if let Err(error) = self.dbs.metadata.lock().await.rem(&db_key) {
                             warn!("{}: Failed to write metadata to DB: {:?}", self, error);
                         }
                     } else if let Err(error) =
-                        self.dbs.metadata.borrow_mut().set(&db_key, &metadata)
+                        self.dbs.metadata.lock().await.set(&db_key, &metadata)
                     {
                         warn!("{}: Failed to write metadata to DB: {:?}", self, error);
                     }
@@ -481,7 +490,7 @@ impl BlobRegister {
         }
 
         // Since the node has left the section, remove it from the holders DB
-        if let Err(error) = self.dbs.holders.borrow_mut().rem(
+        if let Err(error) = self.dbs.holders.lock().await.rem(
             &node.to_db_key()?, // .map_err(|e| DtError::NetworkOther(e.to_string()))?,
         ) {
             warn!("{}: Failed to delete metadata from DB: {:?}", self, error);
@@ -490,8 +499,8 @@ impl BlobRegister {
         Ok(blob_addresses)
     }
 
-    fn get_holder(&self, holder: XorName) -> Result<HolderMetadata> {
-        match self.dbs.holders.borrow().get::<HolderMetadata>(
+    async fn get_holder(&self, holder: XorName) -> Result<HolderMetadata> {
+        match self.dbs.holders.lock().await.get::<HolderMetadata>(
             &holder.to_db_key()?, // .map_err(|e| DtError::NetworkOther(e.to_string()))?,
         ) {
             Some(metadata) => {
@@ -509,8 +518,8 @@ impl BlobRegister {
         }
     }
 
-    fn get_metadata_for(&self, address: BlobAddress) -> Result<ChunkMetadata> {
-        match self.dbs.metadata.borrow().get::<ChunkMetadata>(
+    async fn get_metadata_for(&self, address: BlobAddress) -> Result<ChunkMetadata> {
+        match self.dbs.metadata.lock().await.get::<ChunkMetadata>(
             &address.to_db_key()?, // .map_err(|e| DtError::NetworkOther(e.to_string()))?,
         ) {
             Some(metadata) => {
@@ -561,7 +570,7 @@ impl BlobRegister {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        if let Ok(metadata) = self.get_metadata_for(*target) {
+        if let Ok(metadata) = self.get_metadata_for(*target).await {
             return closest_holders
                 .difference(&metadata.holders)
                 .cloned()

@@ -32,22 +32,22 @@ impl RateLimit {
         let prefix = self.network.our_prefix().await;
         let prefix_len = prefix.bit_count();
 
-        let full_nodes = self.capacity.full_nodes();
+        let full_nodes = self.capacity.full_nodes().await;
         let all_nodes = self.network.our_adults().await.len() as u8;
 
         RateLimit::rate_limit(bytes, full_nodes, all_nodes, prefix_len)
     }
 
     ///
-    pub fn increase_full_node_count(&mut self, node_id: PublicKey) -> Result<()> {
-        self.capacity.increase_full_node_count(node_id)
+    pub async fn increase_full_node_count(&mut self, node_id: PublicKey) -> Result<()> {
+        self.capacity.increase_full_node_count(node_id).await
     }
 
     ///
     pub async fn check_network_storage(&self) -> bool {
         info!("Checking network storage");
         let all_nodes = self.network.our_adults().await.len() as f64;
-        let full_nodes = self.capacity.full_nodes() as f64;
+        let full_nodes = self.capacity.full_nodes().await as f64;
         let usage_ratio = full_nodes / all_nodes;
         info!("Total number of adult nodes: {:?}", all_nodes);
         info!("Number of Full adult nodes: {:?}", full_nodes);

@@ -34,6 +34,7 @@ use std::{
     fmt::{self, Display, Formatter},
     net::SocketAddr,
 };
+use tokio::try_join;
 
 /// Main node struct.
 pub struct Node {
@@ -76,7 +77,7 @@ impl Node {
             res
         };
 
-        let (reward_key, _age_group) = tokio::try_join!(reward_key_task, age_group_task)?;
+        let (reward_key, _age_group) = try_join!(reward_key_task, age_group_task)?;
         let (network_api, network_events) = Network::new(config).await?;
         let keys = NodeSigningKeys::new(network_api.clone());
 
@@ -161,7 +162,7 @@ impl Node {
             } else {
                 NodeDuty::ProcessNetworkEvent(event).into()
             };
-            self.process_while_any(Ok(duty)).await;
+            self.process_while_any(Ok(duty));
         }
 
         Ok(())
@@ -169,31 +170,33 @@ impl Node {
 
     /// Keeps processing resulting node operations.
     async fn process_while_any(&mut self, op: Result<NodeOperation>) {
-        use NodeOperation::*;
-        let mut next_op = op;
-        while let Ok(op) = next_op {
-            next_op = match op {
-                Single(operation) => match self.process(operation).await {
-                    Err(e) => {
-                        self.handle_error(&e);
-                        Ok(NoOp)
+        let _ = tokio::task::spawn(async {
+            use NodeOperation::*;
+            let mut next_op = op;
+            while let Ok(op) = next_op {
+                next_op = match op {
+                    Single(operation) => match self.process(operation).await {
+                        Err(e) => {
+                            self.handle_error(&e);
+                            Ok(NoOp)
+                        }
+                        result => result,
+                    },
+                    Multiple(ops) => {
+                        let mut node_ops = Vec::new();
+                        for c in ops.into_iter() {
+                            match self.process(c).await {
+                                Ok(NoOp) => (),
+                                Ok(op) => node_ops.push(op),
+                                Err(e) => self.handle_error(&e),
+                            };
+                        }
+                        Ok(node_ops.into())
                     }
-                    result => result,
-                },
-                Multiple(ops) => {
-                    let mut node_ops = Vec::new();
-                    for c in ops.into_iter() {
-                        match self.process(c).await {
-                            Ok(NoOp) => (),
-                            Ok(op) => node_ops.push(op),
-                            Err(e) => self.handle_error(&e),
-                        };
-                    }
-                    Ok(node_ops.into())
+                    NoOp => break,
                 }
-                NoOp => break,
             }
-        }
+        });
     }
 
     async fn process(&mut self, duty: NetworkDuty) -> Result<NodeOperation> {
