@@ -33,12 +33,13 @@ use sn_routing::{Event, EventStream, MIN_AGE};
 use std::{
     fmt::{self, Display, Formatter},
     net::SocketAddr,
+    sync::Arc,
 };
-use tokio::try_join;
+use tokio::{sync::Mutex, try_join};
 
 /// Main node struct.
 pub struct Node {
-    duties: NodeDuties,
+    duties: Arc<Mutex<NodeDuties>>,
     network_api: Network,
     network_events: EventStream,
 }
@@ -127,7 +128,7 @@ impl Node {
         };
 
         let node = Self {
-            duties,
+            duties: Arc::new(Mutex::new(duties)),
             network_api,
             network_events,
         };
@@ -162,74 +163,12 @@ impl Node {
             } else {
                 NodeDuty::ProcessNetworkEvent(event).into()
             };
-            self.process_while_any(Ok(duty));
+
+            let duties = Arc::clone(&self.duties);
+            let _ = tokio::task::spawn(process_while_any(Ok(duty), duties));
         }
 
         Ok(())
-    }
-
-    /// Keeps processing resulting node operations.
-    async fn process_while_any(&mut self, op: Result<NodeOperation>) {
-        let _ = tokio::task::spawn(async {
-            use NodeOperation::*;
-            let mut next_op = op;
-            while let Ok(op) = next_op {
-                next_op = match op {
-                    Single(operation) => match self.process(operation).await {
-                        Err(e) => {
-                            self.handle_error(&e);
-                            Ok(NoOp)
-                        }
-                        result => result,
-                    },
-                    Multiple(ops) => {
-                        let mut node_ops = Vec::new();
-                        for c in ops.into_iter() {
-                            match self.process(c).await {
-                                Ok(NoOp) => (),
-                                Ok(op) => node_ops.push(op),
-                                Err(e) => self.handle_error(&e),
-                            };
-                        }
-                        Ok(node_ops.into())
-                    }
-                    NoOp => break,
-                }
-            }
-        });
-    }
-
-    async fn process(&mut self, duty: NetworkDuty) -> Result<NodeOperation> {
-        use NetworkDuty::*;
-        match duty {
-            RunAsAdult(duty) => {
-                info!("Running as Adult: {:?}", duty);
-                if let Some(duties) = self.duties.adult_duties() {
-                    duties.process_adult_duty(duty).await
-                } else {
-                    error!("Currently not an Adult!");
-                    Err(Error::Logic("Currently not an Adult".to_string()))
-                }
-            }
-            RunAsElder(duty) => {
-                info!("Running as Elder: {:?}", duty);
-                if let Some(duties) = self.duties.elder_duties() {
-                    duties.process_elder_duty(duty).await
-                } else {
-                    error!("Currently not an Elder!");
-                    Err(Error::Logic("Currently not an Elder".to_string()))
-                }
-            }
-            RunAsNode(duty) => {
-                info!("Running as Node: {:?}", duty);
-                self.duties.process_node_duty(duty).await
-            }
-            NoOp => Ok(NodeOperation::NoOp),
-        }
-    }
-
-    fn handle_error(&self, err: &Error) {
-        info!("unimplemented: Handle errors.. {}", err)
     }
 }
 
@@ -237,4 +176,66 @@ impl Display for Node {
     fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
         write!(formatter, "Node")
     }
+}
+
+/// Keeps processing resulting node operations.
+async fn process_while_any(op: Result<NodeOperation>, duties: Arc<Mutex<NodeDuties>>) {
+    use NodeOperation::*;
+    let mut next_op = op;
+    while let Ok(op) = next_op {
+        next_op = match op {
+            Single(operation) => match process(operation, Arc::clone(&duties)).await {
+                Err(e) => {
+                    handle_error(&e);
+                    Ok(NoOp)
+                }
+                result => result,
+            },
+            Multiple(ops) => {
+                let mut node_ops = Vec::new();
+                for c in ops.into_iter() {
+                    match process(c, Arc::clone(&duties)).await {
+                        Ok(NoOp) => (),
+                        Ok(op) => node_ops.push(op),
+                        Err(e) => handle_error(&e),
+                    };
+                }
+                Ok(node_ops.into())
+            }
+            NoOp => break,
+        }
+    }
+}
+
+async fn process(duty: NetworkDuty, duties: Arc<Mutex<NodeDuties>>) -> Result<NodeOperation> {
+    use NetworkDuty::*;
+    match duty {
+        RunAsAdult(duty) => {
+            info!("Running as Adult: {:?}", duty);
+            if let Some(duties) = duties.lock().await.adult_duties() {
+                duties.process_adult_duty(duty).await
+            } else {
+                error!("Currently not an Adult!");
+                Err(Error::Logic("Currently not an Adult".to_string()))
+            }
+        }
+        RunAsElder(duty) => {
+            info!("Running as Elder: {:?}", duty);
+            if let Some(duties) = duties.lock().await.elder_duties() {
+                duties.process_elder_duty(duty).await
+            } else {
+                error!("Currently not an Elder!");
+                Err(Error::Logic("Currently not an Elder".to_string()))
+            }
+        }
+        RunAsNode(duty) => {
+            info!("Running as Node: {:?}", duty);
+            duties.lock().await.process_node_duty(duty).await
+        }
+        NoOp => Ok(NodeOperation::NoOp),
+    }
+}
+
+fn handle_error(err: &Error) {
+    info!("unimplemented: Handle errors.. {}", err)
 }
