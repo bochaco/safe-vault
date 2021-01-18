@@ -111,12 +111,13 @@ impl Network {
         dst: DstLocation,
         content: Bytes,
     ) -> Result<(), RoutingError> {
-        self.routing
-            .lock()
-            .await
-            .send_message(src, dst, content)
-            .await
-        // Ok(())
+        let routing = self.routing.clone();
+        tokio::task::spawn(async move {
+            routing.lock().await.send_message(src, dst, content).await?;
+            Ok::<(), RoutingError>(())
+        })
+        .await;
+        Ok(())
     }
 
     pub async fn set_joins_allowed(&mut self, joins_allowed: bool) -> Result<()> {
@@ -129,12 +130,17 @@ impl Network {
     }
 
     pub async fn send_message_to_client(&self, peer_addr: SocketAddr, msg: Bytes) -> Result<()> {
-        self.routing
-            .lock()
-            .await
-            .send_message_to_client(peer_addr, msg)
-            .await
-            .map_err(Error::Routing)
+        let routing = self.routing.clone();
+        tokio::task::spawn(async move {
+            routing
+                .lock()
+                .await
+                .send_message_to_client(peer_addr, msg)
+                .await?;
+            Ok::<(), RoutingError>(())
+        })
+        .await;
+        Ok(())
     }
 
     pub async fn secret_key_share(&self) -> Result<bls::SecretKeyShare> {

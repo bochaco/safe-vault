@@ -112,11 +112,14 @@ impl KeySection {
     }
 
     pub async fn process_key_section_duty(&self, duty: KeySectionDuty) -> Result<NodeOperation> {
-        trace!("Processing as Elder KeySection");
+        trace!("===================Processing as Elder KeySection");
         use KeySectionDuty::*;
         match duty {
             EvaluateClientMsg(msg) => self.msg_analysis.evaluate(&msg).await,
-            RunAsGateway(duty) => self.gateway.process_as_gateway(duty).await,
+            RunAsGateway(duty) => {
+                trace!("===================Processing RunAsGateway");
+                self.gateway.process_as_gateway(duty).await
+            }
             RunAsTransfers(duty) => self.transfers.process_transfer_duty(&duty).await,
             NoOp => Ok(NodeOperation::NoOp),
         }

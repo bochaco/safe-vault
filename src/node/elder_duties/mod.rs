@@ -60,7 +60,7 @@ impl ElderDuties {
 
     /// Processing of any Elder duty.
     pub async fn process_elder_duty(&mut self, duty: ElderDuty) -> Result<NodeOperation> {
-        trace!("Processing elder duty");
+        trace!("===========Processing elder duty");
         use ElderDuty::*;
         match duty {
             ProcessNewMember(name) => self.new_node_joined(name).await,
@@ -75,6 +75,7 @@ impl ElderDuties {
             }
             ProcessElderChange { prefix, .. } => self.elders_changed(prefix).await,
             RunAsKeySection(the_key_duty) => {
+                trace!("===========Processing RunAsKeySection");
                 self.key_section
                     .process_key_section_duty(the_key_duty)
                     .await

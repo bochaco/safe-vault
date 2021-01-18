@@ -47,7 +47,7 @@ impl ClientGateway {
     }
 
     pub async fn process_as_gateway(&self, cmd: GatewayDuty) -> Result<NodeOperation> {
-        trace!("Processing as gateway");
+        trace!("===========Processing as gateway");
         use GatewayDuty::*;
         match cmd {
             FindClientFor(msg) => self.try_find_client(&msg).await,
@@ -74,21 +74,26 @@ impl ClientGateway {
 
     /// This is where client input is parsed.
     async fn process_client_event(&self, event: RoutingEvent) -> Result<NodeOperation> {
-        trace!("Processing client event");
+        trace!("===============Processing client event");
         match event {
             RoutingEvent::ClientMessageReceived { content, src, .. } => {
                 // This check was about checking we knew and client was valid... but even if we don't
                 // we should be handling it...
                 match try_deserialize_handshake(&content, src) {
                     Ok(hs) => {
+                        trace!("=====================Hnadshake processing...");
                         let _ = self.client_msg_handling.process_handshake(hs, src).await;
+                        trace!("=====================Hnadshake processeddd");
                         Ok(NodeOperation::NoOp)
                     }
                     Err(_e) => {
                         // this is not a handshake, so lets try processing as client message...
                         let msg = try_deserialize_msg(content)?;
 
-                        trace!("Deserialized client msg is {:?}", msg.message);
+                        trace!(
+                            "=====================Deserialized client msg is {:?}",
+                            msg.message
+                        );
                         if !validate_client_sig(&msg) {
                             return Err(Error::NetworkData(DtError::InvalidSignature));
                         }
